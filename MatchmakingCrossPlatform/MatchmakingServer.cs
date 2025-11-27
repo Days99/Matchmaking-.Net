@@ -1,4 +1,5 @@
-﻿using System.Net;
+﻿using System.Diagnostics;
+using System.Net;
 using System.Net.Sockets;
 using System.Text;
 
@@ -90,7 +91,7 @@ namespace MatchmakingCrossPlatform
                     if (message.Contains(MessageTerminator))
                     {
                         // Assuming the message is complete and ends with '#'
-                        InterpretClientMessage(message, stream);
+                        InterpretClientMessage(message, stream, player);
                     }
 
                     // Clear the buffer for the next read operation (optional, but good practice)
@@ -109,6 +110,10 @@ namespace MatchmakingCrossPlatform
             {
                 // Client disconnected, close the TcpClient (equivalent to close() or closesocket())
                 Console.WriteLine($"Player {player.Id} disconnected.");
+
+                // Handle session cleanup if player was in a session
+                HandlePlayerDisconnect(player);
+
                 client.Close();
 
                 // Remove player from the global list
@@ -122,7 +127,7 @@ namespace MatchmakingCrossPlatform
         /// <summary>
         /// Parses the client command and sends the appropriate response.
         /// </summary>
-        private void InterpretClientMessage(string message, NetworkStream stream)
+        private void InterpretClientMessage(string message, NetworkStream stream, PlayerInfo player)
         {
             // 1. Split the message by the separator ('|')
             // We use StringSplitOptions.RemoveEmptyEntries to avoid issues with double pipes.
@@ -144,8 +149,8 @@ namespace MatchmakingCrossPlatform
                     {
                         foreach (var session in _sessions)
                         {
-                            // Response format: "s|id|name|serverip|serverport|"
-                            response += $"{session.Id}|{session.Name}|{session.ServerIp}|{session.ServerPort}|";
+                            // Response format: "s|id|name|serverip|serverport|playercount|"
+                            response += $"{session.Id}|{session.Name}|{session.ServerIp}|{session.ServerPort}|{session.PlayerIds.Count}|";
                         }
                     }
                     else
@@ -159,20 +164,28 @@ namespace MatchmakingCrossPlatform
                 SendResponse(response, stream);
             }
             // Command 'h': Host a new game session
-            // Expected parameters: name, serverip, serverport (parts[1], parts[2], parts[3])
-            else if (cmd == 'h' && parts.Length >= 4)
+            // Expected parameters: name (parts[1])
+            else if (cmd == 'h' && parts.Length >= 2)
             {
                 // Parse parameters
                 string sessionName = parts[1];
-                string serverIp = parts[2];
 
-                if (!int.TryParse(parts[3], out int serverPort))
+                // Your preset IP (replace with your actual value)
+                string serverIp = "68.221.160.33";
+
+                // Pick a port from the allowed range
+                int serverPort = GetFreePort();
+                if (serverPort == -1)
                 {
-                    Console.WriteLine("Error: Invalid port number received.");
+                    Console.WriteLine("Error: No available ports to host a session.");
+                    SendResponse("e|NoAvailablePorts|", stream);
                     return;
                 }
 
-                // Create and store the new session
+                // Start dedicated server instance
+                Process? serverProcess = StartDedicatedServer(serverPort);
+
+                // Create and store the session
                 SessionInfo session;
                 lock (_lock)
                 {
@@ -181,17 +194,84 @@ namespace MatchmakingCrossPlatform
                         Id = _sessionCount++,
                         Name = sessionName,
                         ServerIp = serverIp,
-                        ServerPort = serverPort
+                        ServerPort = serverPort,
+                        ServerProcess = serverProcess,
+                        HostPlayerId = player.Id
                     };
+                    // Add the host player to the session
+                    session.PlayerIds.Add(player.Id);
+                    player.SessionId = session.Id;
+
                     _sessions.Add(session);
                 }
 
                 // Send confirmation back to client
-                // Response format: "o|serverport|"
-                string confirmationMessage = $"o|{serverPort}|";
+                // Response format: "o|sessionid|serverip|serverport|"
+                string confirmationMessage = $"o|{session.Id}|{session.ServerIp}|{session.ServerPort}|";
 
-                Console.WriteLine($"New session hosted: {session.Name} at {session.ServerIp}:{session.ServerPort}");
+                Console.WriteLine($"New session hosted: {session.Name} (ID: {session.Id}) at {session.ServerIp}:{session.ServerPort} by Player {player.Id}");
                 SendResponse(confirmationMessage, stream);
+            }
+            // Command 'j': Join a session
+            // Expected parameters: sessionid (parts[1])
+            else if (cmd == 'j' && parts.Length >= 2)
+            {
+                if (int.TryParse(parts[1], out int sessionId))
+                {
+                    lock (_lock)
+                    {
+                        var session = _sessions.FirstOrDefault(s => s.Id == sessionId);
+                        if (session != null)
+                        {
+                            session.PlayerIds.Add(player.Id);
+                            player.SessionId = sessionId;
+
+                            Console.WriteLine($"Player {player.Id} joined session {sessionId}. Total players: {session.PlayerIds.Count}");
+                            SendResponse($"j|success|{session.ServerIp}|{session.ServerPort}|", stream);
+                        }
+                        else
+                        {
+                            SendResponse("e|SessionNotFound|", stream);
+                        }
+                    }
+                }
+            }
+            // Command 'd': Disconnect from current session
+            else if (cmd == 'd')
+            {
+                HandlePlayerLeaveSession(player);
+                SendResponse("d|success|", stream);
+            }
+            // Command 'k': Kill/Shutdown session (only host can do this)
+            // Expected parameters: sessionid (parts[1])
+            else if (cmd == 'k' && parts.Length >= 2)
+            {
+                if (int.TryParse(parts[1], out int sessionId))
+                {
+                    lock (_lock)
+                    {
+                        var session = _sessions.FirstOrDefault(s => s.Id == sessionId);
+                        if (session != null)
+                        {
+                            // Check if the player is the host
+                            if (session.HostPlayerId == player.Id)
+                            {
+                                Console.WriteLine($"Player {player.Id} (host) requested shutdown of session {sessionId}");
+                                ShutdownSession(session);
+                                SendResponse("k|success|", stream);
+                            }
+                            else
+                            {
+                                Console.WriteLine($"Player {player.Id} attempted to shutdown session {sessionId} but is not the host");
+                                SendResponse("e|NotAuthorized|", stream);
+                            }
+                        }
+                        else
+                        {
+                            SendResponse("e|SessionNotFound|", stream);
+                        }
+                    }
+                }
             }
             else
             {
@@ -222,6 +302,171 @@ namespace MatchmakingCrossPlatform
             catch (Exception e)
             {
                 Console.WriteLine($"send() failed: {e.Message}");
+            }
+        }
+
+        private int _minPort = 7777;
+        private int _maxPort = 8090;
+        private HashSet<int> _usedPorts = new HashSet<int>();
+        private object _portLock = new object();
+
+        private int GetFreePort()
+        {
+            lock (_portLock)
+            {
+                for (int port = _minPort; port <= _maxPort; port++)
+                {
+                    if (!_usedPorts.Contains(port))
+                    {
+                        _usedPorts.Add(port);
+                        return port;
+                    }
+                }
+            }
+            return -1;
+        }
+
+        private Process? StartDedicatedServer(int port)
+        {
+            Console.WriteLine("Start Dedicated Server");
+
+            var scriptPath = "./ExampleProjectServer.sh";
+            var workingDir = "../DedicatedServer/";
+
+            Console.WriteLine($"Working directory: {Path.GetFullPath(workingDir)}");
+            Console.WriteLine($"Script path: {Path.GetFullPath(Path.Combine(workingDir, scriptPath))}");
+
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "/bin/bash",
+                Arguments = $"{scriptPath} -port {port}",
+                WorkingDirectory = workingDir,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            Console.WriteLine($"Launching command: /bin/bash {startInfo.Arguments}");
+
+            var process = Process.Start(startInfo);
+
+            if (process == null)
+            {
+                Console.WriteLine($"Failed to start dedicated server on port {port}");
+                return null;
+            }
+
+            Console.WriteLine($"Started server process PID={process.Id} on port {port}");
+
+            // stdout
+            process.OutputDataReceived += (sender, args) =>
+            {
+                if (!string.IsNullOrEmpty(args.Data))
+                    Console.WriteLine($"[SERVER-{port}] {args.Data}");
+            };
+
+            // stderr
+            process.ErrorDataReceived += (sender, args) =>
+            {
+                if (!string.IsNullOrEmpty(args.Data))
+                    Console.WriteLine($"[SERVER-{port} ERR] {args.Data}");
+            };
+
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+
+            // early exit detection
+            Task.Run(async () =>
+            {
+                await Task.Delay(2000);
+                if (process.HasExited)
+                    Console.WriteLine($"[SERVER-{port}] Process exited early with code {process.ExitCode}");
+            });
+
+            return process;
+        }
+
+        /// <summary>
+        /// Handles player disconnect - removes them from their session and cleans up if needed
+        /// </summary>
+        private void HandlePlayerDisconnect(PlayerInfo player)
+        {
+            if (player.SessionId.HasValue)
+            {
+                Console.WriteLine($"Player {player.Id} disconnected while in session {player.SessionId.Value}");
+                HandlePlayerLeaveSession(player);
+            }
+        }
+
+        /// <summary>
+        /// Removes player from their current session and checks if session should be shut down
+        /// </summary>
+        private void HandlePlayerLeaveSession(PlayerInfo player)
+        {
+            if (!player.SessionId.HasValue) return;
+
+            lock (_lock)
+            {
+                var session = _sessions.FirstOrDefault(s => s.Id == player.SessionId.Value);
+                if (session != null)
+                {
+                    session.PlayerIds.Remove(player.Id);
+                    Console.WriteLine($"Player {player.Id} left session {session.Id}. Remaining players: {session.PlayerIds.Count}");
+
+                    // If no players left, shut down the session
+                    if (session.PlayerIds.Count == 0)
+                    {
+                        Console.WriteLine($"Session {session.Id} has no players left. Shutting down...");
+                        ShutdownSession(session);
+                    }
+                }
+                player.SessionId = null;
+            }
+        }
+
+        /// <summary>
+        /// Shuts down a session: kills the dedicated server and removes it from the session list
+        /// </summary>
+        private void ShutdownSession(SessionInfo session)
+        {
+            // This method assumes the lock is already held by the caller
+
+            // Shut down the dedicated server
+            session.ShutdownServer();
+
+            // Free up the port
+            ReleasePort(session.ServerPort);
+
+            // Remove all players from the session
+            foreach (var playerId in session.PlayerIds.ToList())
+            {
+                var player = _players.FirstOrDefault(p => p.Id == playerId);
+                if (player != null)
+                {
+                    player.SessionId = null;
+                }
+            }
+            session.PlayerIds.Clear();
+
+            // Remove the session from the list
+            _sessions.Remove(session);
+
+            Console.WriteLine($"Session {session.Id} ({session.Name}) has been shut down and removed.");
+        }
+
+        /// <summary>
+        /// Releases a port back to the available pool
+        /// </summary>
+        private void ReleasePort(int port)
+        {
+            lock (_portLock)
+            {
+                if (_usedPorts.Contains(port))
+                {
+                    _usedPorts.Remove(port);
+                    Console.WriteLine($"Port {port} has been released back to the pool.");
+                }
             }
         }
     }
